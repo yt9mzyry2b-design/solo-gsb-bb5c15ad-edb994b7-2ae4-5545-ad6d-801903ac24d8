@@ -1,4 +1,4 @@
-"""FastAPI 入口：提交翻页规划、按 ID 查询结果、排练录音时间戳定位、翻页提示与翻页空档。"""
+"""FastAPI 入口：提交翻页规划、按 ID 查询结果、排练录音时间戳定位、翻页提示、翻页空档、纸质谱页序核对、练习页签、练习路线与小册子拼版。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .booklet import BookletError, plan_booklet
 from .planner import Plan, PlanningError, plan_pages
 from .practice_route import PracticeRouteError, plan_practice_route
 from .practice_tabs import PracticeTabError, plan_practice_tabs
@@ -671,6 +672,85 @@ class PracticeRouteResponse(BaseModel):
     )
 
 
+# ---------------------------------------- 纸质乐谱小册子拼版
+
+
+class BookletImpositionRequest(BaseModel):
+    """纸质乐谱小册子拼版请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    section_end_pages: List[int] = Field(
+        ...,
+        description="严格递增的各曲段末页页码（1 基），非空、末项必须等于"
+        "方案页数；曲段是整本谱的有序完整划分，不可跨帖",
+    )
+    max_sheets_per_signature: int = Field(
+        ..., description="每帖最多印张数（正整数；每张印张正反面共 4 页）"
+    )
+
+    @field_validator("section_end_pages", mode="before")
+    @classmethod
+    def _reject_non_integer_ends(cls, value: object) -> object:
+        """页码必须是严格整数：拒绝 1.5 之类浮点（pydantic 默认会强转）与布尔。"""
+        if isinstance(value, list):
+            for end in value:
+                if not isinstance(end, int) or isinstance(end, bool):
+                    raise ValueError(f"曲段末页页码必须为整数（收到 {end!r}）")
+        return value
+
+    @field_validator("max_sheets_per_signature", mode="before")
+    @classmethod
+    def _reject_non_integer_max_sheets(cls, value: object) -> object:
+        """每帖最多印张数必须是严格整数：拒绝浮点与布尔；正数性由核心逻辑校验。"""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"每帖最多印张数必须为整数（收到 {value!r}）")
+        return value
+
+
+class SheetSideOut(BaseModel):
+    """印张一面的左右页码；空白页为 null。"""
+
+    left: Optional[int] = Field(..., description="左页页码（1 基）；空白为 null")
+    right: Optional[int] = Field(..., description="右页页码（1 基）；空白为 null")
+
+
+class SheetOut(BaseModel):
+    """一张印张（从外到内编号）的正反两面。"""
+
+    sheet_index: int = Field(..., description="印张序号（1 基，从外到内）")
+    front: SheetSideOut = Field(..., description="正面左右页码")
+    back: SheetSideOut = Field(..., description="背面左右页码")
+
+
+class SignatureOut(BaseModel):
+    """一帖的原谱页范围、帖尾空白与骑马订拼版结果。"""
+
+    signature_index: int = Field(..., description="帖序号（1 基，按谱面顺序）")
+    start_page: int = Field(..., description="本帖原谱首页页码（1 基）")
+    end_page: int = Field(..., description="本帖原谱末页页码（1 基）")
+    blank_pages: int = Field(
+        ..., description="帖尾空白页数（把本帖页数补到 4 的倍数）"
+    )
+    sheet_count: int = Field(..., description="本帖印张数")
+    sheets: List[SheetOut] = Field(
+        ..., description="从外到内各印张的正反面左右页码"
+    )
+
+
+class BookletImpositionResponse(BaseModel):
+    id: str
+    request: BookletImpositionRequest
+    page_count: int = Field(..., description="已存方案的规划页数")
+    signature_count: int = Field(..., description="帖数（同成本下最少）")
+    total_blank_pages: int = Field(
+        ..., description="总空白页数（各帖帖尾空白之和，全局最小）"
+    )
+    signatures: List[SignatureOut] = Field(
+        ..., description="按谱面顺序的各帖拼版结果"
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -1001,6 +1081,68 @@ def plan_practice_route_for_plan(
         order_pages=result.order_pages,
         segment_distances=result.segment_distances,
         total_distance=result.total_distance,
+    )
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/booklet-imposition",
+    response_model=BookletImpositionResponse,
+)
+def impose_plan_booklet(
+    plan_id: str, payload: BookletImpositionRequest
+) -> BookletImpositionResponse:
+    """为已保存方案做纸质乐谱小册子（骑马订）拼版。
+
+    请求给出严格递增的各曲段末页页码（末项等于方案页数）与每帖最多印张数；
+    曲段不可跨帖、每帖至少含一段，每帖按 4 页倍数在帖尾补空白。用动态规划
+    在合法分帖中依次最小化总空白页数、帖数，同分取各帖末页序列字典序最小
+    者；返回每帖的原谱页范围、空白页数，以及从外到内各印张正反面左右页码
+    （空白为 null）。
+    """
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    plan_result = PlanResult(**record["result"])
+    try:
+        result = plan_booklet(
+            page_count=plan_result.page_count,
+            section_end_pages=payload.section_end_pages,
+            max_sheets_per_signature=payload.max_sheets_per_signature,
+        )
+    except BookletError as exc:
+        # 末页序列非法 / 印张上限非法 / 单段超容量 / 页数超限：语义错误
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return BookletImpositionResponse(
+        id=record["id"],
+        request=payload,
+        page_count=result.page_count,
+        signature_count=result.signature_count,
+        total_blank_pages=result.total_blank_pages,
+        signatures=[
+            SignatureOut(
+                signature_index=sig.signature_index,
+                start_page=sig.start_page,
+                end_page=sig.end_page,
+                blank_pages=sig.blank_pages,
+                sheet_count=sig.sheet_count,
+                sheets=[
+                    SheetOut(
+                        sheet_index=sheet.sheet_index,
+                        front=SheetSideOut(
+                            left=sheet.front.left, right=sheet.front.right
+                        ),
+                        back=SheetSideOut(
+                            left=sheet.back.left, right=sheet.back.right
+                        ),
+                    )
+                    for sheet in sig.sheets
+                ],
+            )
+            for sig in result.signatures
+        ],
     )
 
 
